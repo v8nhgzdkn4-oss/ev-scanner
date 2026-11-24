@@ -18,7 +18,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")    # ditt chat-id
 BOOK             = "unibet_se"                          # Kambi
 MIN_EV           = 0.01     # +1 % mot konsensus
 MIN_EV_PIN       = 0.0      # och minst 0 % mot Pinnacle ensam
-WINDOW_HOURS     = 30       # matcher som startar inom X timmar
+# --- Schema för --cloud (cron-job.org startar var 15:e minut) ---
+BROAD_HOURS      = [8, 13, 18]  # BRED SCAN: kl 08, 13, 18 (svensk tid) – alla matcher BROAD_DAYS framåt
+BROAD_DAYS       = 7
+LINEUP_MIN       = 20           # STARTELVESCAN: matcher som startar om 20–75 min
+LINEUP_MAX       = 75
+LINEUP_HOURS     = list(range(7, 24)) + [0, 1]   # startelvescan körs kl 07:00–01:59
+STATUS_LINEUP    = True         # skicka "✅ Startelvescan ..." även när inget hittas (bara om matcher kollades)
+WINDOW_HOURS     = 30           # används av --loop / manuell körning
 SCAN_HOURS       = range(10, 24)   # --loop: scanna kl 10–23 svensk tid
 INTERVAL_MIN     = 60              # --loop: minuter mellan scans
 MARKETS          = "h2h,totals"        # "h2h" = 1 credit/liga. "h2h,totals" = 2 credits/liga (även över/under)
@@ -126,13 +133,15 @@ def totals(bm):
     return None
 
 # ---------- SCAN ----------
-def scan(min_ev=None, min_ev_pin=None):
+def scan(min_ev=None, min_ev_pin=None, start_min=10, end_min=None):
+    """Scanna matcher som startar mellan nu+start_min och nu+end_min minuter."""
     global n_matches
     n_matches = 0
     min_ev = MIN_EV if min_ev is None else min_ev
     min_ev_pin = MIN_EV_PIN if min_ev_pin is None else min_ev_pin
+    end_min = WINDOW_HOURS * 60 if end_min is None else end_min
     now = dt.datetime.now(dt.timezone.utc)
-    t0, t1 = now + dt.timedelta(minutes=10), now + dt.timedelta(hours=WINDOW_HOURS)
+    t0, t1 = now + dt.timedelta(minutes=start_min), now + dt.timedelta(minutes=end_min)
     picks = []
     for lg in LEAGUES:
         ev_list = get(f"{API}/sports/{lg}/events", {"apiKey": ODDS_API_KEY})  # gratis
@@ -193,6 +202,9 @@ def risk(odds):
 
 def fmt(p):
     ko = p["ko"].astimezone(SE).strftime("%d/%m %H:%M")
+    mins = int((p["ko"] - dt.datetime.now(dt.timezone.utc)).total_seconds() // 60)
+    if 0 < mins <= 120:
+        ko += f" · ⏱ startar om {mins} min"
     bf = f"{p['bf_odds']:.2f}" if p["bf_odds"] else "–"
     pin = f"{p['pin_odds']:.2f}" if isinstance(p["pin_odds"], (int, float)) else p["pin_odds"]
     return (f"⚽ <b>{p['match']}</b> · {ko}\n"
@@ -202,43 +214,55 @@ def fmt(p):
 def telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(text); return
-    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                  data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
-                        "disable_web_page_preview": "true"}, timeout=20)
-    if r.status_code != 200:
-        print("Telegram-fel:", r.status_code, r.text)
+    for cid in [c.strip() for c in str(TELEGRAM_CHAT_ID).split(",") if c.strip()]:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      data={"chat_id": cid, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": "true"}, timeout=20)
+        if r.status_code != 200:
+            print("Telegram-fel:", cid, r.status_code, r.text)
 
 def load_state():
     try: return json.load(open(STATE_FILE))
     except Exception: return {}
 
-def run_once():
-    picks = scan()
+def run_once(mode="normal"):
+    if mode == "broad":
+        picks = scan(start_min=10, end_min=BROAD_DAYS * 24 * 60)
+    elif mode == "lineup":
+        picks = scan(start_min=LINEUP_MIN, end_min=LINEUP_MAX)
+    else:
+        picks = scan()
     state = load_state(); new = []
     for p in sorted(picks, key=lambda x: -x["ev"]):
         key = f"{p['match']}|{p['bet']}"
-        # notifiera bara nya spel, eller om Unibet höjt oddset
-        if key not in state or p["odds"] > state[key][0] + 1e-9:
-            new.append(p); state[key] = [p["odds"], time.time()]
+        # notifiera nya spel, om Kambi höjt oddset, eller om EV stigit minst 2 %-enheter
+        # (t.ex. när Pinnacle rör sig efter startelvorna men Kambi ligger kvar)
+        old = state.get(key)
+        prev_ev = old[2] if old and len(old) > 2 else -1
+        if old is None or p["odds"] > old[0] + 1e-9 or p["ev"] >= prev_ev + 0.02:
+            new.append(p); state[key] = [p["odds"], time.time(), p["ev"]]
     state = {k: v for k, v in state.items() if time.time() - v[1] < 3 * 86400}  # rensa > 3 dagar
     json.dump(state, open(STATE_FILE, "w"))
     stamp = dt.datetime.now(SE).strftime("%H:%M")
+    label = {"broad": "Bred scan", "lineup": "Startelvescan"}.get(mode, "Scan")
+    cr = f" · credits {credits_left}" if credits_left else ""
     if new:
-        msg = "🔔 <b>EV+</b>\n\n" + "\n\n".join(fmt(p) for p in new)
+        head = "🔔 <b>EV+</b>" + (" ⏱ <b>startelvor</b>" if mode == "lineup" else "")
+        msg = head + "\n\n" + "\n\n".join(fmt(p) for p in new)
         telegram(msg)
-    else:
-        cr = f" · credits {credits_left}" if credits_left else ""
-        telegram(f"✅ Scannat {stamp} – inga nya EV+ ({n_matches} matcher){cr}")
-    print(f"[{stamp}] {len(picks)} spel ≥{MIN_EV*100:.0f}% ({len(new)} nya). Credits kvar: {credits_left}")
+    elif mode != "lineup" or (STATUS_LINEUP and n_matches > 0):
+        telegram(f"✅ {label} {stamp} – inga nya EV+ ({n_matches} matcher){cr}")
+    print(f"[{stamp}] {label}: {n_matches} matcher, {len(picks)} spel ≥{MIN_EV*100:.0f}% ({len(new)} nya). Credits kvar: {credits_left}")
 
 if __name__ == "__main__":
     if "--cloud" in sys.argv:
-        # Schema (svensk tid): varje timme 07–15, var 30:e minut 16:00–00:44
+        # cron-job.org startar var 15:e minut. Kl BROAD_HOURS (första kvarten) = bred scan,
+        # annars startelvescan (matcher som börjar om LINEUP_MIN–LINEUP_MAX min).
         now = dt.datetime.now(SE); h, m = now.hour, now.minute
-        hourly = 7 <= h < 16 and m < 30
-        half   = h >= 16 or (h == 0 and m < 45)
-        if hourly or half:
-            run_once()
+        if h in BROAD_HOURS and m < 15:
+            run_once("broad")
+        elif h in LINEUP_HOURS:
+            run_once("lineup")
         else:
             print(f"{now:%H:%M} utanför schemat – ingen scan.")
         sys.exit()
