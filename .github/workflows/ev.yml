@@ -1,0 +1,42 @@
+name: EV scanner
+
+on:
+  schedule:
+    - cron: "0,30 5-23 * * *"   # UTC. Skriptet själv avgör om det ska scanna (svensk tid)
+  workflow_dispatch:             # gör att du kan köra manuellt med en knapp
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ev-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Scan
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python ev_scanner.py --demo
+          else
+            python ev_scanner.py --cloud
+          fi
+      - name: Spara vilka spel som redan notifierats
+        run: |
+          git config user.name "ev-bot"
+          git config user.email "ev-bot@users.noreply.github.com"
+          git add -A ev_sent.json 2>/dev/null || true
+          git commit -m "uppdatera ev_sent.json" || echo "inget nytt"
+          git push || echo "push misslyckades"
