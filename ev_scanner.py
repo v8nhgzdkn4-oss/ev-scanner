@@ -99,6 +99,7 @@ def fair_odds_ou(lam, line, side):
 
 # ---------- API ----------
 credits_left = None
+n_matches = 0
 def get(url, params):
     global credits_left
     r = requests.get(url, params=params, timeout=20)
@@ -126,6 +127,8 @@ def totals(bm):
 
 # ---------- SCAN ----------
 def scan(min_ev=None, min_ev_pin=None):
+    global n_matches
+    n_matches = 0
     min_ev = MIN_EV if min_ev is None else min_ev
     min_ev_pin = MIN_EV_PIN if min_ev_pin is None else min_ev_pin
     now = dt.datetime.now(dt.timezone.utc)
@@ -142,6 +145,7 @@ def scan(min_ev=None, min_ev_pin=None):
         for e in data:
             ko = dt.datetime.fromisoformat(e["commence_time"].replace("Z", "+00:00"))
             if not (t0 <= ko <= t1): continue
+            n_matches += 1
             bms = {b["key"]: b for b in e.get("bookmakers", [])}
             if "pinnacle" not in bms or BOOK not in bms: continue
             home, away = e["home_team"], e["away_team"]
@@ -222,6 +226,9 @@ def run_once():
     if new:
         msg = "🔔 <b>EV+</b>\n\n" + "\n\n".join(fmt(p) for p in new)
         telegram(msg)
+    else:
+        cr = f" · credits {credits_left}" if credits_left else ""
+        telegram(f"✅ Scannat {stamp} – inga nya EV+ ({n_matches} matcher){cr}")
     print(f"[{stamp}] {len(picks)} spel ≥{MIN_EV*100:.0f}% ({len(new)} nya). Credits kvar: {credits_left}")
 
 if __name__ == "__main__":
