@@ -18,7 +18,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")    # ditt chat-id
 BOOK             = "unibet_se"                          # Kambi
 MIN_EV           = 0.01     # +1 % mot konsensus
 MIN_EV_PIN       = 0.0      # och minst 0 % mot Pinnacle ensam
-# --- Schema för --cloud (cron-job.org startar var 15:e minut) ---
+# --- Schema för --cloud (cron-job.org startar var 5:e minut) ---
 BROAD_HOURS      = [8, 13, 18]  # BRED SCAN: kl 08, 13, 18 (svensk tid) – alla matcher BROAD_DAYS framåt
 BROAD_DAYS       = 7
 LINEUP_MIN       = 20           # STARTELVESCAN: matcher som startar om 20–75 min
@@ -43,6 +43,15 @@ LEAGUES = [
  "soccer_uefa_europa_conference_league","soccer_usa_mls","soccer_brazil_campeonato",
  "soccer_argentina_primera_division","soccer_mexico_ligamx","soccer_australia_aleague",
  "soccer_japan_j_league",
+ # extra ligor
+ "soccer_germany_liga3","soccer_england_league2","soccer_sweden_superettan",
+ "soccer_brazil_serie_b","soccer_chile_campeonato","soccer_korea_kleague1",
+ "soccer_conmebol_copa_libertadores","soccer_conmebol_copa_sudamericana",
+ "soccer_fa_cup","soccer_england_efl_cup","soccer_england_efl_trophy",
+ "soccer_spain_copa_del_rey","soccer_italy_coppa_italia","soccer_germany_dfb_pokal",
+ "soccer_france_coupe_de_france","soccer_finland_veikkausliiga","soccer_china_superleague",
+ "soccer_saudi_arabia_pro_league","soccer_league_of_ireland","soccer_uefa_nations_league",
+ "soccer_fifa_world_cup_qualifiers_europe","soccer_fifa_world_cup_qualifiers_south_america",
 ]
 API = "https://api.the-odds-api.com/v4"
 try:
@@ -107,6 +116,7 @@ def fair_odds_ou(lam, line, side):
 # ---------- API ----------
 credits_left = None
 n_matches = 0
+checked = []
 def get(url, params):
     global credits_left
     r = requests.get(url, params=params, timeout=20)
@@ -135,8 +145,9 @@ def totals(bm):
 # ---------- SCAN ----------
 def scan(min_ev=None, min_ev_pin=None, start_min=10, end_min=None):
     """Scanna matcher som startar mellan nu+start_min och nu+end_min minuter."""
-    global n_matches
+    global n_matches, checked
     n_matches = 0
+    checked = []
     min_ev = MIN_EV if min_ev is None else min_ev
     min_ev_pin = MIN_EV_PIN if min_ev_pin is None else min_ev_pin
     end_min = WINDOW_HOURS * 60 if end_min is None else end_min
@@ -156,6 +167,9 @@ def scan(min_ev=None, min_ev_pin=None, start_min=10, end_min=None):
             if not (t0 <= ko <= t1): continue
             n_matches += 1
             bms = {b["key"]: b for b in e.get("bookmakers", [])}
+            mins = int((ko - now).total_seconds() // 60)
+            flag = "" if ("pinnacle" in bms and BOOK in bms) else " (saknar Pin/Kambi)"
+            checked.append(f"{e['home_team']} – {e['away_team']} ({mins} min){flag}")
             if "pinnacle" not in bms or BOOK not in bms: continue
             home, away = e["home_team"], e["away_team"]
             names = [home, "Draw", away]; labels = ["1", "X", "2"]
@@ -212,14 +226,29 @@ def fmt(p):
             f"Pin {pin} · BF {bf}")
 
 def telegram(text):
+    """Skicka till alla chat-id. Returnerar True om alla lyckades."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text); return
+        print(text); return True
+    ok = True
     for cid in [c.strip() for c in str(TELEGRAM_CHAT_ID).split(",") if c.strip()]:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       data={"chat_id": cid, "text": text, "parse_mode": "HTML",
                             "disable_web_page_preview": "true"}, timeout=20)
         if r.status_code != 200:
+            ok = False
             print("Telegram-fel:", cid, r.status_code, r.text)
+    return ok
+
+def telegram_blocks(head, blocks, limit=3800):
+    """Dela upp långa listor i flera meddelanden (Telegram max 4096 tecken)."""
+    ok, msg, part = True, head, 1
+    for b in blocks:
+        if len(msg) + len(b) + 2 > limit:
+            ok &= telegram(msg); part += 1
+            msg = f"{head} (forts. {part})"
+        msg += "\n\n" + b
+    ok &= telegram(msg)
+    return ok
 
 def load_state():
     try: return json.load(open(STATE_FILE))
@@ -233,39 +262,48 @@ def run_once(mode="normal"):
     else:
         picks = scan()
     state = load_state(); new = []
-    for p in sorted(picks, key=lambda x: -x["ev"]):
+    for p in sorted(picks, key=lambda x: (x["ko"], -x["ev"])):
         key = f"{p['match']}|{p['bet']}"
         # notifiera nya spel, om Kambi höjt oddset, eller om EV stigit minst 2 %-enheter
-        # (t.ex. när Pinnacle rör sig efter startelvorna men Kambi ligger kvar)
         old = state.get(key)
         prev_ev = old[2] if old and len(old) > 2 else -1
         if old is None or p["odds"] > old[0] + 1e-9 or p["ev"] >= prev_ev + 0.02:
-            new.append(p); state[key] = [p["odds"], time.time(), p["ev"]]
-    state = {k: v for k, v in state.items() if time.time() - v[1] < 3 * 86400}  # rensa > 3 dagar
-    json.dump(state, open(STATE_FILE, "w"))
+            new.append(p)
     stamp = dt.datetime.now(SE).strftime("%H:%M")
     label = {"broad": "Bred scan", "lineup": "Startelvescan"}.get(mode, "Scan")
     cr = f" · credits {credits_left}" if credits_left else ""
     if new:
-        head = "🔔 <b>EV+</b>" + (" ⏱ <b>startelvor</b>" if mode == "lineup" else "")
-        msg = head + "\n\n" + "\n\n".join(fmt(p) for p in new)
-        telegram(msg)
-    elif mode != "lineup" or (STATUS_LINEUP and n_matches > 0):
+        head = "🔔 <b>EV+</b>" + (" ⏱ <b>startelvor</b>" if mode == "lineup" else f" · {label} {stamp} · {len(new)} spel")
+        sent = telegram_blocks(head, [fmt(p) for p in new])
+        if sent:   # spara bara som "skickade" om Telegram tog emot dem
+            for p in new:
+                state[f"{p['match']}|{p['bet']}"] = [p["odds"], time.time(), p["ev"]]
+    elif mode == "lineup" and STATUS_LINEUP and n_matches > 0:
+        lst = "\n".join("• " + c for c in checked[:15])
+        telegram(f"✅ {label} {stamp} – inga EV+{cr}\n{lst}")
+    elif mode != "lineup":
         telegram(f"✅ {label} {stamp} – inga nya EV+ ({n_matches} matcher){cr}")
+    state = {k: v for k, v in state.items() if time.time() - v[1] < 8 * 86400}  # rensa > 8 dagar
+    json.dump(state, open(STATE_FILE, "w"))
+    for c in checked: print("  kollad:", c)
     print(f"[{stamp}] {label}: {n_matches} matcher, {len(picks)} spel ≥{MIN_EV*100:.0f}% ({len(new)} nya). Credits kvar: {credits_left}")
 
 if __name__ == "__main__":
     if "--cloud" in sys.argv:
-        # cron-job.org startar var 15:e minut. Kl BROAD_HOURS (första kvarten) = bred scan,
+        # cron-job.org startar var 5:e minut. Kl BROAD_HOURS (första 5 min) = bred scan,
         # annars startelvescan (matcher som börjar om LINEUP_MIN–LINEUP_MAX min).
         now = dt.datetime.now(SE); h, m = now.hour, now.minute
-        if h in BROAD_HOURS and m < 15:
+        if h in BROAD_HOURS and m < 5:
             run_once("broad")
         elif h in LINEUP_HOURS:
             run_once("lineup")
         else:
             print(f"{now:%H:%M} utanför schemat – ingen scan.")
         sys.exit()
+    if "--broad" in sys.argv:
+        run_once("broad"); sys.exit()
+    if "--lineup" in sys.argv:
+        run_once("lineup"); sys.exit()
     if "--test" in sys.argv:
         telegram("✅ EV-scannern är kopplad till Telegram!"); print("Testmeddelande skickat."); sys.exit()
     if "--demo" in sys.argv:
